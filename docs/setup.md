@@ -13,8 +13,8 @@
 - **Ports**: Local PostgreSQL (54322), API (54321), Studio (54323)
 
 ### ✅ Database Migration
-- **Migration File**: `supabase/migrations/20250707184812_create_lobby_staging_table.sql`
-- **Schema**: `lobby_staging` table with proper indexes
+- **Migration File**: `supabase/migrations/20250707184812_create_Registration_PrimaryExport_table.sql`
+- **Schema**: `Registration_PrimaryExport` table with proper indexes
 - **Versioning**: Full database schema version control
 
 ## 🚀 ETL Script

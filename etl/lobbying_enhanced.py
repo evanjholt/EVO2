@@ -7,7 +7,6 @@ Connects to local Supabase PostgreSQL (localhost:54322) for development.
 import os
 import sys
 import re
-import io
 import csv
 import zipfile
 import tempfile
@@ -15,16 +14,18 @@ from datetime import datetime, timedelta
 from typing import Iterator
 from urllib.request import urlretrieve
 from urllib.error import URLError
-from pathlib import Path
 
 import psycopg
+from psycopg.sql import SQL, Identifier
 
 
-# Data source URL from Commissioner of Lobbying Canada
+# Configuration constants
 LOBBYING_DATA_URL = "https://lobbycanada.gc.ca/media/zwcjycef/registrations_enregistrements_ocl_cal.zip"
+DAYS_BACK = 730  # Filter data from last 2 years
+BATCH_SIZE = 1000  # Batch size for database inserts
 
-# Date threshold for filtering (last 2 years)
-CUTOFF_DATE = datetime.now() - timedelta(days=730)
+# Date threshold for filtering
+CUTOFF_DATE = datetime.now() - timedelta(days=DAYS_BACK)
 
 
 def snake_case(name: str) -> str:
@@ -34,6 +35,21 @@ def snake_case(name: str) -> str:
     name = name.lower()
     name = re.sub(r'_+', '_', name)
     return name.strip('_')
+
+
+def detect_file_encoding(file_path: str) -> str:
+    """Detect the encoding of a CSV file."""
+    encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
+    
+    for encoding in encodings:
+        try:
+            with open(file_path, 'r', encoding=encoding) as f:
+                f.read(1024)  # Read a small chunk to test encoding
+                return encoding
+        except UnicodeDecodeError:
+            continue
+    
+    raise ValueError("Could not determine file encoding")
 
 
 def download_lobbying_data() -> str:
@@ -54,8 +70,8 @@ def download_lobbying_data() -> str:
 
 
 def extract_primary_csv(zip_path: str) -> tuple[str, list[str]]:
-    """Extract the primary registrations CSV and return headers."""
-    print("Extracting CSV from ZIP archive...")
+    """Extract the Registration_Primary Export CSV and return headers."""
+    print("Extracting Registration_Primary Export CSV from ZIP archive...")
     
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         csv_files = [f for f in zip_ref.namelist() if f.endswith('.csv')]
@@ -64,8 +80,21 @@ def extract_primary_csv(zip_path: str) -> tuple[str, list[str]]:
             print("✗ No CSV files found in archive")
             sys.exit(1)
         
-        primary_csv = csv_files[0]
-        print(f"✓ Found primary CSV: {primary_csv}")
+        # Look for Registration_Primary Export file specifically
+        primary_csv = None
+        for csv_file in csv_files:
+            if 'Registration_Primary' in csv_file or 'registration_primary' in csv_file.lower():
+                primary_csv = csv_file
+                break
+        
+        if not primary_csv:
+            print("Available CSV files:")
+            for f in csv_files:
+                print(f"  - {f}")
+            print("✗ Registration_Primary Export file not found in archive")
+            sys.exit(1)
+        
+        print(f"✓ Found Registration_Primary Export: {primary_csv}")
         
         temp_csv = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.csv')
         temp_csv.close()
@@ -74,87 +103,124 @@ def extract_primary_csv(zip_path: str) -> tuple[str, list[str]]:
             with open(temp_csv.name, 'wb') as target:
                 target.write(source.read())
         
+        # Define the specific columns we want to extract
+        target_columns = [
+            'REG_ID_ENR',
+            'REG_TYPE_ENR', 
+            'EFFECTIVE_DATE_VIGUEUR',
+            'END_DATE_FIN',
+            'EN_FIRM_NM_FIRME_AN',
+            'CLIENT_ORG_CORP_NUM',
+            'EN_CLIENT_ORG_CORP_NM_AN',
+            'SUBSIDIARY_IND_FILIALE',
+            'PARENT_IND_SOC_MERE',
+            'RGSTRNT_1ST_NM_PRENOM_DCLRNT',
+            'RGSTRNT_LAST_NM_DCLRNT',
+            'RGSTRNT_ADDRESS_ADRESSE_DCLRNT',
+            'GOVT_FUND_IND_FIN_GOUV',
+            'FY_END_DATE_FIN_EXERCICE',
+            'POSTED_DATE_PUBLICATION'
+        ]
+        
         # Read headers with encoding detection
-        for encoding in ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']:
-            try:
-                with open(temp_csv.name, 'r', encoding=encoding) as f:
-                    reader = csv.reader(f)
-                    headers = next(reader)
-                    snake_headers = [snake_case(h) for h in headers]
-                    print(f"✓ Using encoding: {encoding}")
-                    break
-            except UnicodeDecodeError:
-                continue
-        else:
-            print("✗ Could not determine file encoding")
+        try:
+            encoding = detect_file_encoding(temp_csv.name)
+            print(f"✓ Using encoding: {encoding}")
+            
+            with open(temp_csv.name, 'r', encoding=encoding) as f:
+                reader = csv.reader(f)
+                headers = next(reader)
+                
+                # Find column indices for our target columns
+                column_indices = []
+                snake_headers = []
+                
+                for target_col in target_columns:
+                    try:
+                        idx = headers.index(target_col)
+                        column_indices.append(idx)
+                        snake_headers.append(snake_case(target_col))
+                    except ValueError:
+                        print(f"✗ Column '{target_col}' not found in CSV")
+                        print(f"Available columns: {', '.join(headers[:10])}...")  # Show first 10
+                        sys.exit(1)
+                        
+        except ValueError as e:
+            print(f"✗ {e}")
             sys.exit(1)
         
-        print(f"✓ Extracted CSV with {len(snake_headers)} columns")
-        return temp_csv.name, snake_headers
+        print(f"✓ Extracted CSV with {len(snake_headers)} target columns")
+        return temp_csv.name, snake_headers, column_indices
 
 
-def filter_recent_rows(csv_path: str, headers: list[str]) -> Iterator[list[str]]:
+def filter_recent_rows(csv_path: str, headers: list[str], column_indices: list[int]) -> Iterator[list[str]]:
     """Filter CSV rows to only include registrations from the last 2 years."""
     print(f"Filtering data to last 2 years (since {CUTOFF_DATE.strftime('%Y-%m-%d')})...")
     
-    # Try to find a date column
-    date_col_idx = None
+    # Find the index for POSTED_DATE_PUBLICATION in snake_case headers
+    posted_date_idx = None
     for i, header in enumerate(headers):
-        if any(date_term in header.lower() for date_term in ['date', 'created', 'registered', 'filed']):
-            date_col_idx = i
+        if header == 'posted_date_publication':
+            posted_date_idx = i
             break
     
-    # Try different encodings to read the CSV file
-    for encoding in ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']:
-        try:
-            if date_col_idx is None:
-                print("⚠ No date column found, returning all rows")
-                with open(csv_path, 'r', encoding=encoding) as f:
-                    reader = csv.reader(f)
-                    next(reader)  # Skip header
-                    yield from reader
-                return
-            
-            filtered_count = 0
-            total_count = 0
-            
-            with open(csv_path, 'r', encoding=encoding) as f:
-                reader = csv.reader(f)
-                next(reader)  # Skip header
-                
-                for row in reader:
-                    total_count += 1
-                    
-                    if len(row) > date_col_idx:
-                        date_str = row[date_col_idx]
-                        try:
-                            for fmt in ['%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d/%m/%Y']:
-                                try:
-                                    row_date = datetime.strptime(date_str, fmt)
-                                    break
-                                except ValueError:
-                                    continue
-                            else:
-                                yield row
-                                filtered_count += 1
-                                continue
-                            
-                            if row_date >= CUTOFF_DATE:
-                                yield row
-                                filtered_count += 1
-                                
-                        except (ValueError, IndexError):
-                            yield row
-                            filtered_count += 1
-            
-            print(f"✓ Filtered {filtered_count:,} rows from {total_count:,} total rows")
-            return
-            
-        except UnicodeDecodeError:
-            continue
+    if posted_date_idx is None:
+        print("✗ POSTED_DATE_PUBLICATION column not found in target headers")
+        sys.exit(1)
     
-    print("✗ Could not read CSV file with any encoding")
-    sys.exit(1)
+    # Read CSV file with detected encoding
+    try:
+        encoding = detect_file_encoding(csv_path)
+        filtered_count = 0
+        total_count = 0
+        
+        with open(csv_path, 'r', encoding=encoding) as f:
+            reader = csv.reader(f)
+            next(reader)  # Skip header
+            
+            for row in reader:
+                total_count += 1
+                
+                # Extract target columns
+                filtered_row = []
+                for idx in column_indices:
+                    if idx < len(row):
+                        filtered_row.append(row[idx])
+                    else:
+                        filtered_row.append('')  # Empty string for missing columns
+                
+                # Check POSTED_DATE_PUBLICATION for filtering
+                if posted_date_idx < len(filtered_row):
+                    date_str = filtered_row[posted_date_idx]
+                    
+                    # Skip rows with null or empty dates
+                    if date_str in ['null', '', None]:
+                        continue
+                        
+                    try:
+                        for fmt in ['%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d/%m/%Y']:
+                            try:
+                                row_date = datetime.strptime(date_str, fmt)
+                                break
+                            except ValueError:
+                                continue
+                        else:
+                            # If we can't parse the date, skip the row
+                            continue
+                        
+                        if row_date >= CUTOFF_DATE:
+                            yield filtered_row
+                            filtered_count += 1
+                            
+                    except (ValueError, IndexError):
+                        # If date parsing fails, skip the row
+                        continue
+        
+        print(f"✓ Filtered {filtered_count:,} rows from {total_count:,} total rows")
+        
+    except ValueError as e:
+        print(f"✗ {e}")
+        sys.exit(1)
 
 
 class LocalConnectionManager:
@@ -177,57 +243,56 @@ class LocalConnectionManager:
             sys.exit(1)
     
     def create_table(self, headers: list[str]) -> None:
-        """Create the lobby_staging table."""
-        print("Creating lobby_staging table...")
+        """Create the Registration_PrimaryExport table."""
+        print("Creating Registration_PrimaryExport table...")
         
         columns = [f"{header} TEXT" for header in headers]
         columns_sql = ",\n    ".join(columns)
         
         create_table_sql = f"""
-        DROP TABLE IF EXISTS lobby_staging;
-        CREATE TABLE lobby_staging (
+        DROP TABLE IF EXISTS "Registration_PrimaryExport";
+        CREATE TABLE "Registration_PrimaryExport" (
             {columns_sql}
         );
-        CREATE INDEX IF NOT EXISTS idx_lobby_staging_reg_id ON lobby_staging(reg_id_enr);
-        CREATE INDEX IF NOT EXISTS idx_lobby_staging_country ON lobby_staging(country_pays);
+        CREATE INDEX IF NOT EXISTS "idx_Registration_PrimaryExport_reg_id" ON "Registration_PrimaryExport"(reg_id_enr);
+        CREATE INDEX IF NOT EXISTS "idx_Registration_PrimaryExport_posted_date" ON "Registration_PrimaryExport"(posted_date_publication);
         """
         
         with self.postgres_conn.cursor() as cur:
             cur.execute(create_table_sql)
             self.postgres_conn.commit()
         
-        print("✓ Created lobby_staging table with indexes")
+        print("✓ Created Registration_PrimaryExport table with indexes")
     
-    def insert_data(self, csv_path: str, headers: list[str]) -> None:
-        """Insert data using PostgreSQL COPY FROM STDIN."""
-        print("Streaming data using PostgreSQL COPY...")
+    def insert_data(self, csv_path: str, headers: list[str], column_indices: list[int]) -> None:
+        """Insert data using PostgreSQL executemany."""
+        print("Inserting data using PostgreSQL executemany...")
         
         with self.postgres_conn.cursor() as cur:
-            copy_sql = f"COPY lobby_staging ({', '.join(headers)}) FROM STDIN WITH CSV"
+            # Create the SQL statement
+            insert_sql = SQL("INSERT INTO {} ({}) VALUES ({})").format(
+                Identifier('Registration_PrimaryExport'),
+                SQL(', ').join(map(Identifier, headers)),
+                SQL(', ').join(SQL('%s') for _ in headers)
+            )
             
-            buffer = io.StringIO()
-            writer = csv.writer(buffer)
+            # Collect all rows first
+            all_rows = list(filter_recent_rows(csv_path, headers, column_indices))
+            row_count = len(all_rows)
             
-            row_count = 0
-            for row in filter_recent_rows(csv_path, headers):
-                writer.writerow(row)
-                row_count += 1
+            if row_count > 0:
+                # Insert data in batches
+                for i in range(0, row_count, BATCH_SIZE):
+                    batch = all_rows[i:i + BATCH_SIZE]
+                    cur.executemany(insert_sql, batch)
+                    
+                    if (i + BATCH_SIZE) % 10000 == 0:
+                        print(f"  Inserted {i + BATCH_SIZE:,} rows...")
                 
-                # Flush buffer periodically
-                if row_count % 10000 == 0:
-                    buffer.seek(0)
-                    cur.copy(copy_sql, buffer)
-                    buffer.seek(0)
-                    buffer.truncate(0)
-                    print(f"  Streamed {row_count:,} rows...")
-            
-            # Final flush
-            if buffer.tell() > 0:
-                buffer.seek(0)
-                cur.copy(copy_sql, buffer)
-            
-            self.postgres_conn.commit()
-            print(f"✓ Successfully streamed {row_count:,} rows using PostgreSQL COPY")
+                self.postgres_conn.commit()
+                print(f"✓ Successfully inserted {row_count:,} rows using PostgreSQL executemany")
+            else:
+                print("⚠ No rows to insert after filtering")
     
     def close(self) -> None:
         """Close the database connection."""
@@ -238,10 +303,11 @@ class LocalConnectionManager:
 def cleanup_temp_files(*file_paths: str) -> None:
     """Clean up temporary files."""
     for file_path in file_paths:
-        try:
-            os.unlink(file_path)
-        except OSError:
-            pass
+        if file_path:  # Only try to delete if path exists
+            try:
+                os.unlink(file_path)
+            except OSError:
+                pass
 
 
 def main() -> None:
@@ -256,7 +322,7 @@ def main() -> None:
     try:
         # Download and extract data
         zip_path = download_lobbying_data()
-        csv_path, headers = extract_primary_csv(zip_path)
+        csv_path, headers, column_indices = extract_primary_csv(zip_path)
         
         # Establish local database connection
         conn_manager = LocalConnectionManager()
@@ -264,13 +330,13 @@ def main() -> None:
         
         # Create table and insert data
         conn_manager.create_table(headers)
-        conn_manager.insert_data(csv_path, headers)
+        conn_manager.insert_data(csv_path, headers, column_indices)
         
         # Success summary
         duration = datetime.now() - start_time
         print("\n" + "=" * 50)
         print(f"✓ ETL completed successfully in {duration}")
-        print(f"✓ Data loaded into lobby_staging table via local PostgreSQL")
+        print(f"✓ Data loaded into Registration_PrimaryExport table via local PostgreSQL")
         print(f"✓ Columns: {len(headers)}")
         
         conn_manager.close()

@@ -13,7 +13,7 @@
 - [x] Configure local development environment
 - [x] Create supabase/config.toml with project configuration
 - [x] Set up local database schema migration
-- [x] Create migration file for lobby_staging table
+- [x] Create migration file for Registration_PrimaryExport table
 - [x] Start local Supabase stack (supabase start) - Docker networking issue identified
 - [x] Verify local PostgreSQL connection works - Network restrictions confirmed
 
@@ -30,7 +30,7 @@
 - `etl/lobbying_enhanced.py` - Enhanced ETL with automatic connection fallback
 - `etl/lobbying_unified.py` - Unified interface supporting all connection methods
 - `supabase/config.toml` - Supabase CLI configuration
-- `supabase/migrations/20250707184812_create_lobby_staging_table.sql` - Database schema migration
+- `supabase/migrations/20250707184812_create_Registration_PrimaryExport_table.sql` - Database schema migration
 - `pyproject.toml` - Added requests dependency for REST API
 - `SUPABASE_SETUP.md` - Complete setup documentation
 
