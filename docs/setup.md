@@ -1,10 +1,10 @@
-# Supabase CLI Setup and Migration Summary
+# Supabase Local Development Setup
 
-## 🎉 Completed Setup
+## 🎉 Setup Complete
 
 ### ✅ Supabase CLI Installation
 - **Version**: 2.30.4
-- **Installation**: Successfully installed from GitHub releases
+- **Installation**: Successfully installed
 - **Configuration**: Local development stack configured
 
 ### ✅ Project Initialization  
@@ -17,17 +17,19 @@
 - **Schema**: `lobby_staging` table with proper indexes
 - **Versioning**: Full database schema version control
 
-## 🚀 ETL Scripts Available
+## 🚀 ETL Script
 
-### 1. **Enhanced ETL** (`etl/lobbying_enhanced.py`) - **RECOMMENDED**
-**Automatic connection fallback**: Local PostgreSQL → Remote PostgreSQL → REST API
+### **Local ETL** (`etl/lobbying_enhanced.py`)
+**Local PostgreSQL connection only** for streamlined development
 
 ```bash
 python etl/lobbying_enhanced.py
 ```
 
 **Features:**
-- ✅ **10x faster** with PostgreSQL COPY when available  
+- ✅ **High performance** with PostgreSQL COPY operations
+- ✅ **Local development** optimized
+- ✅ **Simplified connection** - localhost:54322 only  
 - ✅ **Network resilient** - falls back to REST API when PostgreSQL blocked
 - ✅ **Encoding detection** - handles CSV encoding issues
 - ✅ **Error handling** - graceful failures with clear messages

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Enhanced ETL script for Canadian lobbying registrations data.
-Supports automatic fallback: Local PostgreSQL → Remote PostgreSQL → REST API.
+Local ETL script for Canadian lobbying registrations data.
+Connects to local Supabase PostgreSQL (localhost:54322) for development.
 """
 
 import os
@@ -9,18 +9,15 @@ import sys
 import re
 import io
 import csv
-import json
 import zipfile
 import tempfile
 from datetime import datetime, timedelta
-from typing import Iterator, Dict, Any, List, Optional, Tuple
+from typing import Iterator
 from urllib.request import urlretrieve
 from urllib.error import URLError
 from pathlib import Path
-from enum import Enum
 
 import psycopg
-import requests
 
 
 # Data source URL from Commissioner of Lobbying Canada
@@ -28,27 +25,6 @@ LOBBYING_DATA_URL = "https://lobbycanada.gc.ca/media/zwcjycef/registrations_enre
 
 # Date threshold for filtering (last 2 years)
 CUTOFF_DATE = datetime.now() - timedelta(days=730)
-
-# Batch size for REST API insertions
-BATCH_SIZE = 1000
-
-
-class ConnectionMethod(Enum):
-    LOCAL_POSTGRES = "local_postgres"
-    REMOTE_POSTGRES = "remote_postgres"
-    REST_API = "rest_api"
-
-
-def load_env_file() -> None:
-    """Load environment variables from .env file if it exists."""
-    env_path = Path(__file__).parent.parent / '.env'
-    if env_path.exists():
-        with open(env_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, value = line.split('=', 1)
-                    os.environ[key] = value
 
 
 def snake_case(name: str) -> str:
@@ -181,106 +157,27 @@ def filter_recent_rows(csv_path: str, headers: list[str]) -> Iterator[list[str]]
     sys.exit(1)
 
 
-class ConnectionManager:
-    """Manages database connections with automatic fallback."""
+class LocalConnectionManager:
+    """Manages local PostgreSQL connection for development."""
     
     def __init__(self):
-        self.supabase_url = os.getenv('SUPABASE_URL')
-        self.supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
-        
-        if not self.supabase_url or not self.supabase_key:
-            print("✗ Missing SUPABASE_URL or SUPABASE_SERVICE_KEY environment variables")
-            sys.exit(1)
-        
-        self.host = self.supabase_url.replace('https://', '').replace('http://', '')
-        self.connection_method = None
         self.postgres_conn = None
-        self.rest_client = None
     
-    def test_local_postgres(self) -> bool:
-        """Test connection to local Supabase PostgreSQL."""
+    def establish_connection(self) -> None:
+        """Establish local PostgreSQL connection."""
+        print("Connecting to local Supabase PostgreSQL...")
+        
         try:
-            conn_string = f"postgresql://postgres:postgres@localhost:54322/postgres"
-            with psycopg.connect(conn_string, connect_timeout=5) as conn:
-                print("✓ Local PostgreSQL connection successful")
-                return True
+            conn_string = "postgresql://postgres:postgres@localhost:54322/postgres"
+            self.postgres_conn = psycopg.connect(conn_string, connect_timeout=10)
+            print("✓ Local PostgreSQL connection successful")
         except Exception as e:
             print(f"✗ Local PostgreSQL connection failed: {e}")
-            return False
-    
-    def test_remote_postgres(self) -> bool:
-        """Test connection to remote Supabase PostgreSQL."""
-        for port in [6543, 5432]:
-            try:
-                conn_string = f"postgresql://postgres:{self.supabase_key}@{self.host}:{port}/postgres?sslmode=require"
-                with psycopg.connect(conn_string, connect_timeout=5) as conn:
-                    print(f"✓ Remote PostgreSQL connection successful on port {port}")
-                    return True
-            except Exception as e:
-                print(f"✗ Remote PostgreSQL connection failed on port {port}: {e}")
-                continue
-        return False
-    
-    def test_rest_api(self) -> bool:
-        """Test connection to Supabase REST API."""
-        try:
-            headers = {
-                'apikey': self.supabase_key,
-                'Authorization': f'Bearer {self.supabase_key}',
-                'Content-Type': 'application/json'
-            }
-            response = requests.get(f"{self.supabase_url}/rest/v1/", headers=headers, timeout=10)
-            if response.status_code == 200:
-                print("✓ REST API connection successful")
-                return True
-            else:
-                print(f"✗ REST API connection failed: {response.status_code}")
-                return False
-        except Exception as e:
-            print(f"✗ REST API connection failed: {e}")
-            return False
-    
-    def establish_connection(self) -> ConnectionMethod:
-        """Establish connection using the first available method."""
-        print("Testing database connections...")
-        
-        # Try local PostgreSQL first
-        if self.test_local_postgres():
-            self.connection_method = ConnectionMethod.LOCAL_POSTGRES
-            conn_string = f"postgresql://postgres:postgres@localhost:54322/postgres"
-            self.postgres_conn = psycopg.connect(conn_string, connect_timeout=10)
-            return ConnectionMethod.LOCAL_POSTGRES
-        
-        # Try remote PostgreSQL
-        if self.test_remote_postgres():
-            self.connection_method = ConnectionMethod.REMOTE_POSTGRES
-            for port in [6543, 5432]:
-                try:
-                    conn_string = f"postgresql://postgres:{self.supabase_key}@{self.host}:{port}/postgres?sslmode=require"
-                    self.postgres_conn = psycopg.connect(conn_string, connect_timeout=10)
-                    break
-                except:
-                    continue
-            return ConnectionMethod.REMOTE_POSTGRES
-        
-        # Fall back to REST API
-        if self.test_rest_api():
-            self.connection_method = ConnectionMethod.REST_API
-            self.rest_client = SupabaseRESTClient(self.supabase_url, self.supabase_key)
-            return ConnectionMethod.REST_API
-        
-        print("✗ All connection methods failed")
-        sys.exit(1)
+            print("  Make sure Supabase is running: supabase start")
+            sys.exit(1)
     
     def create_table(self, headers: list[str]) -> None:
         """Create the lobby_staging table."""
-        if self.connection_method in [ConnectionMethod.LOCAL_POSTGRES, ConnectionMethod.REMOTE_POSTGRES]:
-            self._create_table_postgres(headers)
-        else:
-            self._create_table_rest(headers)
-    
-    def _create_table_postgres(self, headers: list[str]) -> None:
-        """Create table using PostgreSQL connection."""
         print("Creating lobby_staging table...")
         
         columns = [f"{header} TEXT" for header in headers]
@@ -301,37 +198,7 @@ class ConnectionManager:
         
         print("✓ Created lobby_staging table with indexes")
     
-    def _create_table_rest(self, headers: list[str]) -> None:
-        """Create table using REST API (requires manual creation)."""
-        if self.rest_client.table_exists("lobby_staging"):
-            print("✓ lobby_staging table already exists")
-            return
-        
-        print("✗ lobby_staging table doesn't exist")
-        print("\nTo create the table, run this SQL in your Supabase SQL editor:")
-        print("=" * 60)
-        
-        columns_sql = ",\n    ".join([f"{col} TEXT" for col in headers])
-        create_sql = f"""
-CREATE TABLE lobby_staging (
-    {columns_sql}
-);
-CREATE INDEX idx_lobby_staging_reg_id ON lobby_staging(reg_id_enr);
-CREATE INDEX idx_lobby_staging_country ON lobby_staging(country_pays);
-"""
-        print(create_sql)
-        print("=" * 60)
-        print("\nAfter creating the table, run this script again.")
-        sys.exit(1)
-    
     def insert_data(self, csv_path: str, headers: list[str]) -> None:
-        """Insert data using the established connection method."""
-        if self.connection_method in [ConnectionMethod.LOCAL_POSTGRES, ConnectionMethod.REMOTE_POSTGRES]:
-            self._insert_data_postgres(csv_path, headers)
-        else:
-            self._insert_data_rest(csv_path, headers)
-    
-    def _insert_data_postgres(self, csv_path: str, headers: list[str]) -> None:
         """Insert data using PostgreSQL COPY FROM STDIN."""
         print("Streaming data using PostgreSQL COPY...")
         
@@ -362,79 +229,10 @@ CREATE INDEX idx_lobby_staging_country ON lobby_staging(country_pays);
             self.postgres_conn.commit()
             print(f"✓ Successfully streamed {row_count:,} rows using PostgreSQL COPY")
     
-    def _insert_data_rest(self, csv_path: str, headers: list[str]) -> None:
-        """Insert data using REST API in batches."""
-        print("Streaming data using REST API...")
-        
-        batch = []
-        row_count = 0
-        
-        for row in filter_recent_rows(csv_path, headers):
-            row_dict = {header: value for header, value in zip(headers, row)}
-            batch.append(row_dict)
-            row_count += 1
-            
-            if len(batch) >= BATCH_SIZE:
-                if self.rest_client.insert_batch("lobby_staging", batch):
-                    print(f"  Streamed {row_count:,} rows...")
-                else:
-                    print(f"✗ Failed to insert batch at row {row_count}")
-                    sys.exit(1)
-                batch = []
-        
-        # Insert final batch
-        if batch:
-            if self.rest_client.insert_batch("lobby_staging", batch):
-                print(f"✓ Successfully streamed {row_count:,} rows using REST API")
-            else:
-                print(f"✗ Failed to insert final batch")
-                sys.exit(1)
-    
     def close(self) -> None:
         """Close the database connection."""
         if self.postgres_conn:
             self.postgres_conn.close()
-
-
-class SupabaseRESTClient:
-    """Simple REST API client for Supabase."""
-    
-    def __init__(self, url: str, service_key: str):
-        self.url = url.rstrip('/')
-        self.service_key = service_key
-        self.headers = {
-            'apikey': service_key,
-            'Authorization': f'Bearer {service_key}',
-            'Content-Type': 'application/json',
-            'Prefer': 'return=minimal'
-        }
-        self.rest_url = f"{self.url}/rest/v1"
-    
-    def table_exists(self, table_name: str) -> bool:
-        """Check if a table exists."""
-        try:
-            response = requests.get(
-                f"{self.rest_url}/{table_name}?limit=1",
-                headers=self.headers,
-                timeout=10
-            )
-            return response.status_code == 200
-        except Exception:
-            return False
-    
-    def insert_batch(self, table_name: str, data: List[Dict[str, Any]]) -> bool:
-        """Insert a batch of records."""
-        try:
-            response = requests.post(
-                f"{self.rest_url}/{table_name}",
-                headers=self.headers,
-                json=data,
-                timeout=60
-            )
-            return response.status_code in [200, 201, 204]
-        except Exception as e:
-            print(f"Batch insert failed: {e}")
-            return False
 
 
 def cleanup_temp_files(*file_paths: str) -> None:
@@ -447,11 +245,10 @@ def cleanup_temp_files(*file_paths: str) -> None:
 
 
 def main() -> None:
-    """Main ETL process with automatic connection fallback."""
-    print("🏛️  Canadian Lobbying Data ETL (Enhanced)")
-    print("=" * 55)
+    """Main ETL process for local development."""
+    print("🏛️  Canadian Lobbying Data ETL (Local)")
+    print("=" * 50)
     
-    load_env_file()
     start_time = datetime.now()
     zip_path = None
     csv_path = None
@@ -461,11 +258,9 @@ def main() -> None:
         zip_path = download_lobbying_data()
         csv_path, headers = extract_primary_csv(zip_path)
         
-        # Establish database connection with fallback
-        conn_manager = ConnectionManager()
-        method = conn_manager.establish_connection()
-        
-        print(f"✓ Using connection method: {method.value}")
+        # Establish local database connection
+        conn_manager = LocalConnectionManager()
+        conn_manager.establish_connection()
         
         # Create table and insert data
         conn_manager.create_table(headers)
@@ -473,9 +268,9 @@ def main() -> None:
         
         # Success summary
         duration = datetime.now() - start_time
-        print("\n" + "=" * 55)
+        print("\n" + "=" * 50)
         print(f"✓ ETL completed successfully in {duration}")
-        print(f"✓ Data loaded into lobby_staging table via {method.value}")
+        print(f"✓ Data loaded into lobby_staging table via local PostgreSQL")
         print(f"✓ Columns: {len(headers)}")
         
         conn_manager.close()
